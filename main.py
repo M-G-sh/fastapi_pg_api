@@ -5,23 +5,31 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Integer, String, Float, text
-from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column, Session
+from sqlalchemy.orm import (
+    sessionmaker,
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    Session,
+)
 from dotenv import load_dotenv
 
-# -----------------------------
+# =============================
 # 1) تحميل متغيرات البيئة
-# -----------------------------
+# =============================
 load_dotenv()
 
-# Railway/Prod يفترض يوفر DATABASE_URL. عند عدم وجوده نستخدم قيمة للتطوير المحلي.
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/demo_db",
-)
+# نقرأ DATABASE_URL من البيئة (Railway)،
+# ونوفّر قيمة افتراضية للتجربة محليًا.
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/demo_db")
 
-# -----------------------------
+# بعض المنصات القديمة ترجع postgres:// فنحوّلها لـ postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# =============================
 # 2) إعداد SQLAlchemy
-# -----------------------------
+# =============================
 # pool_pre_ping=True لتفادي سقوط الاتصال الصامت
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -32,9 +40,9 @@ class Base(DeclarativeBase):
     pass
 
 
-# -----------------------------
+# =============================
 # 3) الموديلات (جداول قاعدة البيانات)
-# -----------------------------
+# =============================
 class User(Base):
     __tablename__ = "users"
 
@@ -55,9 +63,9 @@ class Place(Base):
 # مفيش create_all هنا عشان ما نجبرش الاتصال وقت الاستيراد.
 # Base.metadata.create_all(bind=engine)
 
-# -----------------------------
+# =============================
 # 4) السكيمات (Pydantic Schemas)
-# -----------------------------
+# =============================
 class UserCreate(BaseModel):
     name: str
     email: EmailStr
@@ -88,15 +96,15 @@ class PlaceOut(BaseModel):
         from_attributes = True  # pydantic v2
 
 
-# -----------------------------
+# =============================
 # 5) تطبيق FastAPI + CORS
-# -----------------------------
+# =============================
 app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.1.0")
 
-# CORS (مفتوح أثناء التطوير)
+# CORS (خلّيه واسع أثناء التطوير، وضيّقه في الإنتاج)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # غيّرها لدوميناتك في الإنتاج
+    allow_origins=["*"],  # في الإنتاج: ["https://your-domain.com", ...]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -112,28 +120,36 @@ def get_db() -> Session:
         db.close()
 
 
-# -----------------------------
+# =============================
 # 6) تهيئة قاعدة البيانات عند الإقلاع
-# -----------------------------
+# =============================
 @app.on_event("startup")
 def on_startup():
-    """اتصال مبدئي بقاعدة البيانات + إنشاء الجداول بعد تأكد الاتصال."""
+    """
+    اتصال مبدئي بقاعدة البيانات + إنشاء الجداول بعد تأكد الاتصال.
+    لو الاتصال فشل، بنطبع الخطأ فقط بدون إسقاط السيرفر.
+    """
     try:
         with engine.connect() as conn:
-            # اختبار سريع للاتصال
-            conn.execute(text("SELECT 1"))
-        # بعد نجاح الاتصال، ننشئ الجداول (بديل سريع لـ Alembic أثناء التطوير)
-        Base.metadata.create_all(bind=engine)
+            conn.execute(text("SELECT 1"))  # اختبار سريع للاتصال
+        Base.metadata.create_all(bind=engine)  # إنشاء الجداول (مؤقتًا بدل Alembic)
         print("✅ DB connected & tables ensured")
     except Exception as e:
-        # من الأفضل عدم إسقاط السيرفس: اطبع الخطأ وسيظهر في اللوج
+        # ما نوقعش السيرفس عشان /health يفضل يرد
         print(f"❌ DB init error: {e}")
 
 
-# -----------------------------
+# =============================
 # 7) المسارات (Endpoints)
-# -----------------------------
-@app.get("/health")
+# =============================
+
+# مسار خفيف جدًا للتأكد إن السيرفر عايش
+@app.get("/", include_in_schema=False)
+def root():
+    return {"message": "API is alive"}
+
+# مسار صحة لا يلمس DB
+@app.get("/health", include_in_schema=False)
 def health():
     return {"status": "ok"}
 
