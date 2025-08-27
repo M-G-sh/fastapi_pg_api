@@ -1,5 +1,0 @@
-POSTGRES_USER=shokry
-POSTGRES_PASSWORD=Shokry_1234
-POSTGRES_DB=testdb
-
-DATABASE_URL=postgresql://shokry:Shokry_1234@localhost:5432/testdb
