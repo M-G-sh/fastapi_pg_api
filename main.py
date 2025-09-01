@@ -1,6 +1,7 @@
 import os
 from typing import List
-
+from fastapi import FastAPI, Depends, HTTPException, Response  # ← زود Response
+import json  # ← جديد
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -185,3 +186,31 @@ def create_place(place: PlaceCreate, db: Session = Depends(get_db)):
 @app.get("/places", response_model=List[PlaceOut])
 def list_places(db: Session = Depends(get_db)):
     return db.query(Place).order_by(Place.id.desc()).all()
+@app.get("/places/geojson", include_in_schema=False)
+def places_geojson(db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT id, name, latitude, longitude
+        FROM public.places
+        WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+        ORDER BY id ASC
+    """)).mappings().all()
+
+    features = []
+    for r in rows:
+        features.append({
+            "type": "Feature",
+            "id": int(r["id"]),
+            "geometry": {
+                "type": "Point",
+                "coordinates": [float(r["longitude"]), float(r["latitude"])]
+            },
+            "properties": {
+                "name": r["name"]
+            }
+        })
+
+    collection = {"type": "FeatureCollection", "features": features}
+    return Response(
+        content=json.dumps(collection, ensure_ascii=False),
+        media_type="application/geo+json"
+    )
