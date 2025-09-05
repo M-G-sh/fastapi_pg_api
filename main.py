@@ -1,118 +1,129 @@
 import os
-from typing import List
-from fastapi import FastAPI, Depends, HTTPException, Response  # ← زود Response
-import json  # ← جديد
-from fastapi import FastAPI, Depends, HTTPException
+import uuid
+import json
+from typing import List, Optional
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Integer, String, Float, text
-from sqlalchemy.orm import (
-    sessionmaker,
-    DeclarativeBase,
-    Mapped,
-    mapped_column,
-    Session,
-)
+from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column, Session
 from dotenv import load_dotenv
 
 # =============================
 # 1) تحميل متغيرات البيئة
 # =============================
 load_dotenv()
-
-# نقرأ DATABASE_URL من البيئة (Railway)،
-# ونوفّر قيمة افتراضية للتجربة محليًا.
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/demo_db")
-
-# بعض المنصات القديمة ترجع postgres:// فنحوّلها لـ postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # =============================
 # 2) إعداد SQLAlchemy
 # =============================
-# pool_pre_ping=True لتفادي سقوط الاتصال الصامت
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-
 class Base(DeclarativeBase):
-    """Base class for SQLAlchemy models."""
     pass
 
-
 # =============================
-# 3) الموديلات (جداول قاعدة البيانات)
+# 3) الموديلات
 # =============================
 class User(Base):
     __tablename__ = "users"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     email: Mapped[str] = mapped_column(String(200), unique=True, index=True, nullable=False)
-
 
 class Place(Base):
     __tablename__ = "places"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     latitude: Mapped[float] = mapped_column(Float, nullable=False)
     longitude: Mapped[float] = mapped_column(Float, nullable=False)
 
+    # حقول إضافية (كلها اختيارية)
+    FACILITYID:       Mapped[Optional[str]]   = mapped_column(String(50), nullable=True)
+    ELEVATION:        Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    INVERTLEVEL:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    GROUNDLEVEL:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    CONTRACTOR:       Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
+    SUBCONTRACTOR:    Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
+    PROJECTNO:        Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
+    PHASENO:          Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
+    ITEMNO:           Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
+    INSTALLATIONDATE: Mapped[Optional[str]]   = mapped_column(String(50),  nullable=True)  # استخدم Date لو حابب
+    COVERMATERIAL:    Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
+    X:                Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    Y:                Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ARNAME:           Mapped[Optional[str]]   = mapped_column(String(200), nullable=True)
+    ENNAME:           Mapped[Optional[str]]   = mapped_column(String(200), nullable=True)
+    WALLTHICKNESS:    Mapped[Optional[str]]   = mapped_column(String(200), nullable=True)
+    MNOHLESHAPE:      Mapped[Optional[str]]   = mapped_column(String(200), nullable=True)
+    DIMENSION:        Mapped[Optional[str]]   = mapped_column(String(200), nullable=True)
+    URLLINK:          Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
 
-# مفيش create_all هنا عشان ما نجبرش الاتصال وقت الاستيراد.
-# Base.metadata.create_all(bind=engine)
+    image_url:        Mapped[Optional[str]]   = mapped_column(String(500), nullable=True)
 
 # =============================
-# 4) السكيمات (Pydantic Schemas)
+# 4) السكيمات
 # =============================
 class UserCreate(BaseModel):
     name: str
     email: EmailStr
 
-
 class UserOut(BaseModel):
     id: int
     name: str
     email: EmailStr
-
     class Config:
-        from_attributes = True  # pydantic v2
-
+        from_attributes = True
 
 class PlaceCreate(BaseModel):
-    name: str
+    name: Optional[str] = None
     latitude: float
     longitude: float
+    FACILITYID: Optional[str] = None
+    ELEVATION: Optional[float] = None
+    INVERTLEVEL: Optional[float] = None
+    GROUNDLEVEL: Optional[float] = None
+    CONTRACTOR: Optional[str] = None
+    SUBCONTRACTOR: Optional[str] = None
+    PROJECTNO: Optional[str] = None
+    PHASENO: Optional[str] = None
+    ITEMNO: Optional[str] = None
+    INSTALLATIONDATE: Optional[str] = None
+    COVERMATERIAL: Optional[str] = None
+    X: Optional[float] = None
+    Y: Optional[float] = None
+    ARNAME: Optional[str] = None
+    ENNAME: Optional[str] = None
+    WALLTHICKNESS: Optional[str] = None
+    MNOHLESHAPE: Optional[str] = None
+    DIMENSION: Optional[str] = None
+    URLLINK: Optional[str] = None
 
-
-class PlaceOut(BaseModel):
+class PlaceOut(PlaceCreate):
     id: int
-    name: str
-    latitude: float
-    longitude: float
-
+    image_url: Optional[str] = None
     class Config:
-        from_attributes = True  # pydantic v2
-
+        from_attributes = True
 
 # =============================
-# 5) تطبيق FastAPI + CORS
+# 5) التطبيق + CORS + رفع ملفات
 # =============================
-app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.1.0")
-
-# CORS (خلّيه واسع أثناء التطوير، وضيّقه في الإنتاج)
+app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # في الإنتاج: ["https://your-domain.com", ...]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# تبعية: جلسة DB لكل طلب
 def get_db() -> Session:
     db = SessionLocal()
     try:
@@ -120,76 +131,115 @@ def get_db() -> Session:
     finally:
         db.close()
 
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # =============================
-# 6) تهيئة قاعدة البيانات عند الإقلاع
+# 6) Startup
 # =============================
 @app.on_event("startup")
 def on_startup():
-    """
-    اتصال مبدئي بقاعدة البيانات + إنشاء الجداول بعد تأكد الاتصال.
-    لو الاتصال فشل، بنطبع الخطأ فقط بدون إسقاط السيرفر.
-    """
     try:
         with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))  # اختبار سريع للاتصال
-        Base.metadata.create_all(bind=engine)  # إنشاء الجداول (مؤقتًا بدل Alembic)
+            conn.execute(text("SELECT 1"))
+        Base.metadata.create_all(bind=engine)
         print("✅ DB connected & tables ensured")
     except Exception as e:
-        # ما نوقعش السيرفس عشان /health يفضل يرد
         print(f"❌ DB init error: {e}")
 
-
 # =============================
-# 7) المسارات (Endpoints)
+# 7) Endpoints
 # =============================
-
-# مسار خفيف جدًا للتأكد إن السيرفر عايش
 @app.get("/", include_in_schema=False)
 def root():
     return {"message": "API is alive"}
 
-# مسار صحة لا يلمس DB
 @app.get("/health", include_in_schema=False)
 def health():
     return {"status": "ok"}
 
-
 # ---- Users ----
 @app.post("/users", response_model=UserOut)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.email == user.email).first()
-    if existing:
+    if db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=409, detail="Email already exists")
-    db_user = User(name=user.name, email=user.email)
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
-
+    u = User(name=user.name, email=user.email)
+    db.add(u); db.commit(); db.refresh(u)
+    return u
 
 @app.get("/users", response_model=List[UserOut])
 def list_users(db: Session = Depends(get_db)):
     return db.query(User).order_by(User.id.desc()).all()
 
-
-# ---- Places ----
+# ---- Places (JSON) ----
 @app.post("/places", response_model=PlaceOut)
 def create_place(place: PlaceCreate, db: Session = Depends(get_db)):
-    p = Place(name=place.name, latitude=place.latitude, longitude=place.longitude)
-    db.add(p)
-    db.commit()
-    db.refresh(p)
+    p = Place(**place.model_dump())
+    db.add(p); db.commit(); db.refresh(p)
     return p
-
 
 @app.get("/places", response_model=List[PlaceOut])
 def list_places(db: Session = Depends(get_db)):
     return db.query(Place).order_by(Place.id.desc()).all()
+
+# ---- Places + Image (multipart) ----
+@app.post("/places/upload", response_model=PlaceOut)
+async def create_place_with_image(
+    name: Optional[str] = Form(None),
+    latitude: float = Form(...),
+    longitude: float = Form(...),
+
+    FACILITYID: Optional[str] = Form(None),
+    ELEVATION: Optional[float] = Form(None),
+    INVERTLEVEL: Optional[float] = Form(None),
+    GROUNDLEVEL: Optional[float] = Form(None),
+    CONTRACTOR: Optional[str] = Form(None),
+    SUBCONTRACTOR: Optional[str] = Form(None),
+    PROJECTNO: Optional[str] = Form(None),
+    PHASENO: Optional[str] = Form(None),
+    ITEMNO: Optional[str] = Form(None),
+    INSTALLATIONDATE: Optional[str] = Form(None),
+    COVERMATERIAL: Optional[str] = Form(None),
+    X: Optional[float] = Form(None),
+    Y: Optional[float] = Form(None),
+    ARNAME: Optional[str] = Form(None),
+    ENNAME: Optional[str] = Form(None),
+    WALLTHICKNESS: Optional[str] = Form(None),
+    MNOHLESHAPE: Optional[str] = Form(None),
+    DIMENSION: Optional[str] = Form(None),
+    URLLINK: Optional[str] = Form(None),
+
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    ext = os.path.splitext(image.filename)[1].lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        raise HTTPException(status_code=400, detail="Unsupported image type")
+
+    fname = f"{uuid.uuid4().hex}{ext}"
+    fpath = os.path.join(UPLOAD_DIR, fname)
+    with open(fpath, "wb") as f:
+        f.write(await image.read())
+    image_url = f"/uploads/{fname}"
+
+    p = Place(
+        name=name, latitude=latitude, longitude=longitude,
+        FACILITYID=FACILITYID, ELEVATION=ELEVATION, INVERTLEVEL=INVERTLEVEL,
+        GROUNDLEVEL=GROUNDLEVEL, CONTRACTOR=CONTRACTOR, SUBCONTRACTOR=SUBCONTRACTOR,
+        PROJECTNO=PROJECTNO, PHASENO=PHASENO, ITEMNO=ITEMNO, INSTALLATIONDATE=INSTALLATIONDATE,
+        COVERMATERIAL=COVERMATERIAL, X=X, Y=Y, ARNAME=ARNAME, ENNAME=ENNAME,
+        WALLTHICKNESS=WALLTHICKNESS, MNOHLESHAPE=MNOHLESHAPE, DIMENSION=DIMENSION, URLLINK=URLLINK,
+        image_url=image_url
+    )
+    db.add(p); db.commit(); db.refresh(p)
+    return p
+
+# ---- GeoJSON ----
 @app.get("/places/geojson", include_in_schema=False)
 def places_geojson(db: Session = Depends(get_db)):
     rows = db.execute(text("""
-        SELECT id, name, latitude, longitude
+        SELECT id, name, latitude, longitude, image_url
         FROM public.places
         WHERE latitude IS NOT NULL AND longitude IS NOT NULL
         ORDER BY id ASC
@@ -200,17 +250,8 @@ def places_geojson(db: Session = Depends(get_db)):
         features.append({
             "type": "Feature",
             "id": int(r["id"]),
-            "geometry": {
-                "type": "Point",
-                "coordinates": [float(r["longitude"]), float(r["latitude"])]
-            },
-            "properties": {
-                "name": r["name"]
-            }
+            "geometry": {"type": "Point", "coordinates": [float(r["longitude"]), float(r["latitude"])]},
+            "properties": {"name": r["name"], "image_url": r["image_url"]}
         })
-
     collection = {"type": "FeatureCollection", "features": features}
-    return Response(
-        content=json.dumps(collection, ensure_ascii=False),
-        media_type="application/geo+json"
-    )
+    return Response(content=json.dumps(collection, ensure_ascii=False), media_type="application/geo+json")
