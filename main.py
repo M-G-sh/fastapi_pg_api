@@ -252,7 +252,17 @@ def create_place(place: PlaceCreate, db: Session = Depends(get_db)):
 
 @app.get("/places", response_model=List[PlaceOut])
 def list_places(db: Session = Depends(get_db)):
-    return db.query(Place).order_by(Place.id.desc()).all()
+    return (
+        db.query(Place)
+        .filter(
+            Place.latitude  >= -90,
+            Place.latitude  <= 90,
+            Place.longitude >= -180,
+            Place.longitude <= 180,
+        )
+        .order_by(Place.id.desc())
+        .all()
+    )
 
 # ---- Places + Image (multipart) ----
 @app.post("/places/upload", response_model=PlaceOut)
