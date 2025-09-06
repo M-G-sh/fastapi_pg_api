@@ -2,12 +2,16 @@
 import os
 import uuid
 import json
+import logging
+import traceback
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, Query
+from fastapi import (
+    FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, Query, Request, Header
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Integer, String, Float, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column, Session
 from dotenv import load_dotenv
@@ -19,6 +23,8 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/demo_db")
 if DATABASE_URL.startswith("postgres://"):  # railway/old URIs
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # اختياري لتنظيف الداتا
 
 # =============================
 # 2) SQLAlchemy
@@ -85,8 +91,9 @@ class UserOut(BaseModel):
 
 class PlaceCreate(BaseModel):
     name: Optional[str] = None
-    latitude: float
-    longitude: float
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+
     FACILITYID: Optional[str] = None
     ELEVATION: Optional[float] = None
     INVERTLEVEL: Optional[float] = None
@@ -114,15 +121,30 @@ class PlaceOut(PlaceCreate):
         from_attributes = True
 
 # =============================
-# 5) App + CORS + static
+# 5) App + CORS + static + logging
 # =============================
-app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.3.0")
+app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+logger = logging.getLogger("uvicorn.error")
+
+@app.middleware("http")
+async def error_logger(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logger.error("Unhandled error: %s\n%s", e, traceback.format_exc())
+        return Response(
+            content=json.dumps({"detail": "internal_error", "error": str(e)}),
+            media_type="application/json",
+            status_code=500,
+        )
 
 def get_db() -> Session:
     db = SessionLocal()
@@ -136,7 +158,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # =============================
-# 6) Startup (health + tables + indexes)
+# 6) Startup (health + tables + indexes + checks)
 # =============================
 @app.on_event("startup")
 def on_startup():
@@ -145,20 +167,38 @@ def on_startup():
             conn.execute(text("SELECT 1"))
         Base.metadata.create_all(bind=engine)
 
-        # فهارس اختيارية لتحسين الأداء عند البحث المكاني (بدون PostGIS)
+        # فهارس اختيارية
         with engine.begin() as conn:
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS idx_places_lat ON public.places (latitude)"
-            ))
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS idx_places_lng ON public.places (longitude)"
-            ))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lat ON public.places (latitude)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lng ON public.places (longitude)"))
+
+            # إضافة قيود CHECK للإحداثيات (نتجاهل لو موجودة)
+            try:
+                conn.execute(text(
+                    "ALTER TABLE public.places ADD CONSTRAINT chk_lat CHECK (latitude BETWEEN -90 AND 90)"
+                ))
+            except Exception:
+                pass
+            try:
+                conn.execute(text(
+                    "ALTER TABLE public.places ADD CONSTRAINT chk_lng CHECK (longitude BETWEEN -180 AND 180)"
+                ))
+            except Exception:
+                pass
+
         print("✅ DB connected & tables/indexes ensured")
     except Exception as e:
         print(f"❌ DB init error: {e}")
 
 # =============================
-# 7) Endpoints
+# 7) Helpers
+# =============================
+def validate_latlng(lat: float, lng: float):
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        raise HTTPException(status_code=422, detail="Invalid latitude/longitude")
+
+# =============================
+# 8) Endpoints
 # =============================
 @app.get("/", include_in_schema=False)
 def root():
@@ -174,7 +214,13 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=409, detail="Email already exists")
     u = User(name=user.name, email=user.email)
-    db.add(u); db.commit(); db.refresh(u)
+    db.add(u)
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise
+    db.refresh(u)
     return u
 
 @app.get("/users", response_model=List[UserOut])
@@ -184,12 +230,20 @@ def list_users(db: Session = Depends(get_db)):
 # ---- Places (JSON) ----
 @app.post("/places", response_model=PlaceOut)
 def create_place(place: PlaceCreate, db: Session = Depends(get_db)):
+    # Pydantic already validates bounds
     p = Place(**place.model_dump())
-    db.add(p); db.commit(); db.refresh(p)
+    db.add(p)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(p)
     return p
 
 @app.get("/places", response_model=List[PlaceOut])
 def list_places(db: Session = Depends(get_db)):
+    # رجّع الكل كما هو (لو عايز فقط السليم، حط WHERE في SQLAlchemy فلتر)
     return db.query(Place).order_by(Place.id.desc()).all()
 
 # ---- Places + Image (multipart) ----
@@ -222,14 +276,22 @@ async def create_place_with_image(
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    ext = os.path.splitext(image.filename)[1].lower()
+    # تحقق يدوي من الإحداثيات في multipart
+    validate_latlng(latitude, longitude)
+
+    ext = os.path.splitext(image.filename or "")[1].lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
         raise HTTPException(status_code=400, detail="Unsupported image type")
 
     fname = f"{uuid.uuid4().hex}{ext}"
     fpath = os.path.join(UPLOAD_DIR, fname)
+    # اكتب الملف مباشرة بدون الاحتفاظ به في الذاكرة
     with open(fpath, "wb") as f:
-        f.write(await image.read())
+        while True:
+            chunk = await image.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
     image_url = f"/uploads/{fname}"
 
     p = Place(
@@ -241,16 +303,31 @@ async def create_place_with_image(
         WALLTHICKNESS=WALLTHICKNESS, MNOHLESHAPE=MNOHLESHAPE, DIMENSION=DIMENSION, URLLINK=URLLINK,
         image_url=image_url
     )
-    db.add(p); db.commit(); db.refresh(p)
+    db.add(p)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        # لو فشل الإدخال، احذف الملف اللي اتحفظ
+        try:
+            os.remove(fpath)
+        except Exception:
+            pass
+        raise
+    db.refresh(p)
     return p
 
 # ---- GeoJSON للتطبيق/الخريطة ----
 @app.get("/places/geojson", include_in_schema=False)
 def places_geojson(db: Session = Depends(get_db)):
+    # رجّع فقط السجلات ذات الإحداثيات الصحيحة
     rows = db.execute(text("""
         SELECT id, name, latitude, longitude, image_url
         FROM public.places
-        WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+        WHERE latitude BETWEEN -90 AND 90
+          AND longitude BETWEEN -180 AND 180
+          AND latitude IS NOT NULL
+          AND longitude IS NOT NULL
         ORDER BY id ASC
     """)).mappings().all()
 
@@ -259,7 +336,10 @@ def places_geojson(db: Session = Depends(get_db)):
         features.append({
             "type": "Feature",
             "id": int(r["id"]),
-            "geometry": {"type": "Point", "coordinates": [float(r["longitude"]), float(r["latitude"])]},
+            "geometry": {
+                "type": "Point",
+                "coordinates": [float(r["longitude"]), float(r["latitude"])]
+            },
             "properties": {"name": r["name"], "image_url": r["image_url"]},
         })
     collection = {"type": "FeatureCollection", "features": features}
@@ -278,6 +358,8 @@ def get_near_places(
     يرجّع أقرب الأماكن مترتّبة بالمسافة (متر) باستخدام معادلة Haversine.
     بنستخدم Bounding Box أولًا ثم نحسب المسافة بدقة لتسريع الاستعلام.
     """
+    validate_latlng(lat, lng)
+
     # درجة تقريبية للمتر (عند خط الاستواء ≈ 111.32 كم لكل درجة)
     deg = radius_m / 111_320.0
     sql = text("""
@@ -288,10 +370,31 @@ def get_near_places(
                 sin(radians(:lat)) * sin(radians(latitude))
             ))) AS dist_m
         FROM public.places
-        WHERE latitude  BETWEEN :lat - :deg AND :lat + :deg
+        WHERE latitude BETWEEN -90 AND 90
+          AND longitude BETWEEN -180 AND 180
+          AND latitude  BETWEEN :lat - :deg AND :lat + :deg
           AND longitude BETWEEN :lng - :deg AND :lng + :deg
         ORDER BY dist_m
         LIMIT :limit
     """)
     rows = db.execute(sql, {"lat": lat, "lng": lng, "deg": deg, "limit": limit}).mappings().all()
     return [dict(r) for r in rows]
+
+# ---- تنظيف السجلات الخارجة عن المدى (اختياري/إداري) ----
+@app.post("/admin/places/cleanup")
+def cleanup_invalid_coords(
+    x_admin_token: Optional[str] = Header(None, alias="x-admin-token"),
+    db: Session = Depends(get_db),
+):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    res = db.execute(text("""
+        UPDATE public.places
+        SET latitude = NULL, longitude = NULL
+        WHERE NOT (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+        RETURNING id
+    """))
+    ids = [r[0] for r in res.fetchall()]
+    db.commit()
+    return {"cleaned": ids, "count": len(ids)}
