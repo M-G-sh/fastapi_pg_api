@@ -1,9 +1,10 @@
+# main.py
 import os
 import uuid
 import json
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
@@ -12,24 +13,24 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column,
 from dotenv import load_dotenv
 
 # =============================
-# 1) تحميل متغيرات البيئة
+# 1) Env
 # =============================
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/demo_db")
-if DATABASE_URL.startswith("postgres://"):
+if DATABASE_URL.startswith("postgres://"):  # railway/old URIs
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # =============================
-# 2) إعداد SQLAlchemy
+# 2) SQLAlchemy
 # =============================
-engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 class Base(DeclarativeBase):
     pass
 
 # =============================
-# 3) الموديلات
+# 3) Models
 # =============================
 class User(Base):
     __tablename__ = "users"
@@ -42,10 +43,10 @@ class Place(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
-    latitude: Mapped[float] = mapped_column(Float, nullable=False)
-    longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    latitude: Mapped[float] = mapped_column(Float, nullable=False, index=True)
+    longitude: Mapped[float] = mapped_column(Float, nullable=False, index=True)
 
-    # حقول إضافية (كلها اختيارية)
+    # حقول إضافية (اختيارية)
     FACILITYID:       Mapped[Optional[str]]   = mapped_column(String(50), nullable=True)
     ELEVATION:        Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     INVERTLEVEL:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -55,7 +56,7 @@ class Place(Base):
     PROJECTNO:        Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
     PHASENO:          Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
     ITEMNO:           Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
-    INSTALLATIONDATE: Mapped[Optional[str]]   = mapped_column(String(50),  nullable=True)  # استخدم Date لو حابب
+    INSTALLATIONDATE: Mapped[Optional[str]]   = mapped_column(String(50),  nullable=True)
     COVERMATERIAL:    Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
     X:                Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     Y:                Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -69,7 +70,7 @@ class Place(Base):
     image_url:        Mapped[Optional[str]]   = mapped_column(String(500), nullable=True)
 
 # =============================
-# 4) السكيمات
+# 4) Schemas
 # =============================
 class UserCreate(BaseModel):
     name: str
@@ -113,15 +114,14 @@ class PlaceOut(PlaceCreate):
         from_attributes = True
 
 # =============================
-# 5) التطبيق + CORS + رفع ملفات
+# 5) App + CORS + static
 # =============================
-app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.2.0")
+app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.3.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 def get_db() -> Session:
@@ -136,7 +136,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # =============================
-# 6) Startup
+# 6) Startup (health + tables + indexes)
 # =============================
 @app.on_event("startup")
 def on_startup():
@@ -144,7 +144,16 @@ def on_startup():
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         Base.metadata.create_all(bind=engine)
-        print("✅ DB connected & tables ensured")
+
+        # فهارس اختيارية لتحسين الأداء عند البحث المكاني (بدون PostGIS)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_places_lat ON public.places (latitude)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_places_lng ON public.places (longitude)"
+            ))
+        print("✅ DB connected & tables/indexes ensured")
     except Exception as e:
         print(f"❌ DB init error: {e}")
 
@@ -235,7 +244,7 @@ async def create_place_with_image(
     db.add(p); db.commit(); db.refresh(p)
     return p
 
-# ---- GeoJSON ----
+# ---- GeoJSON للتطبيق/الخريطة ----
 @app.get("/places/geojson", include_in_schema=False)
 def places_geojson(db: Session = Depends(get_db)):
     rows = db.execute(text("""
@@ -251,7 +260,38 @@ def places_geojson(db: Session = Depends(get_db)):
             "type": "Feature",
             "id": int(r["id"]),
             "geometry": {"type": "Point", "coordinates": [float(r["longitude"]), float(r["latitude"])]},
-            "properties": {"name": r["name"], "image_url": r["image_url"]}
+            "properties": {"name": r["name"], "image_url": r["image_url"]},
         })
     collection = {"type": "FeatureCollection", "features": features}
     return Response(content=json.dumps(collection, ensure_ascii=False), media_type="application/geo+json")
+
+# ---- أقرب أماكن (بدون PostGIS) ----
+@app.get("/places/near")
+def get_near_places(
+    lat: float = Query(..., description="Latitude"),
+    lng: float = Query(..., description="Longitude"),
+    radius_m: int = Query(2000, ge=1, le=100000, description="Search radius in meters"),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """
+    يرجّع أقرب الأماكن مترتّبة بالمسافة (متر) باستخدام معادلة Haversine.
+    بنستخدم Bounding Box أولًا ثم نحسب المسافة بدقة لتسريع الاستعلام.
+    """
+    # درجة تقريبية للمتر (عند خط الاستواء ≈ 111.32 كم لكل درجة)
+    deg = radius_m / 111_320.0
+    sql = text("""
+        SELECT id, name, latitude, longitude, image_url,
+            (6371000 * acos(LEAST(1,
+                cos(radians(:lat)) * cos(radians(latitude)) *
+                cos(radians(longitude) - radians(:lng)) +
+                sin(radians(:lat)) * sin(radians(latitude))
+            ))) AS dist_m
+        FROM public.places
+        WHERE latitude  BETWEEN :lat - :deg AND :lat + :deg
+          AND longitude BETWEEN :lng - :deg AND :lng + :deg
+        ORDER BY dist_m
+        LIMIT :limit
+    """)
+    rows = db.execute(sql, {"lat": lat, "lng": lng, "deg": deg, "limit": limit}).mappings().all()
+    return [dict(r) for r in rows]
