@@ -26,6 +26,17 @@ if DATABASE_URL.startswith("postgres://"):  # railway/old URIs
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # اختياري لتنظيف الداتا
 
+# مسار رفع الملفات:
+UPLOAD_DIR = os.getenv("UPLOAD_DIR")
+if not UPLOAD_DIR:
+    # إذا شغال على Railway استخدم /tmp
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        UPLOAD_DIR = "/tmp/uploads"
+    else:
+        UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 # =============================
 # 2) SQLAlchemy
 # =============================
@@ -123,7 +134,7 @@ class PlaceOut(PlaceCreate):
 # =============================
 # 5) App + CORS + static + logging
 # =============================
-app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.4.0")
+app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,12 +150,15 @@ async def error_logger(request: Request, call_next):
         response = await call_next(request)
         return response
     except Exception as e:
-        logger.error("Unhandled error: %s\n%s", e, traceback.format_exc())
+        logger.error("Unhandled error on %s %s: %s\n%s",
+                     request.method, request.url.path, e, traceback.format_exc())
         return Response(
             content=json.dumps({"detail": "internal_error", "error": str(e)}),
             media_type="application/json",
             status_code=500,
         )
+
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 def get_db() -> Session:
     db = SessionLocal()
@@ -152,10 +166,6 @@ def get_db() -> Session:
         yield db
     finally:
         db.close()
-
-UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # =============================
 # 6) Startup (health + tables + indexes + checks)
@@ -167,12 +177,10 @@ def on_startup():
             conn.execute(text("SELECT 1"))
         Base.metadata.create_all(bind=engine)
 
-        # فهارس اختيارية
+        # فهارس + قيود CHECK
         with engine.begin() as conn:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lat ON public.places (latitude)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lng ON public.places (longitude)"))
-
-            # إضافة قيود CHECK للإحداثيات (نتجاهل لو موجودة)
             try:
                 conn.execute(text(
                     "ALTER TABLE public.places ADD CONSTRAINT chk_lat CHECK (latitude BETWEEN -90 AND 90)"
@@ -186,7 +194,7 @@ def on_startup():
             except Exception:
                 pass
 
-        print("✅ DB connected & tables/indexes ensured")
+        print(f"✅ DB connected & tables/indexes ensured | UPLOAD_DIR={UPLOAD_DIR}")
     except Exception as e:
         print(f"❌ DB init error: {e}")
 
@@ -196,6 +204,8 @@ def on_startup():
 def validate_latlng(lat: float, lng: float):
     if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
         raise HTTPException(status_code=422, detail="Invalid latitude/longitude")
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB
 
 # =============================
 # 8) Endpoints
@@ -217,7 +227,7 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db.add(u)
     try:
         db.commit()
-    except Exception as e:
+    except Exception:
         db.rollback()
         raise
     db.refresh(u)
@@ -230,7 +240,6 @@ def list_users(db: Session = Depends(get_db)):
 # ---- Places (JSON) ----
 @app.post("/places", response_model=PlaceOut)
 def create_place(place: PlaceCreate, db: Session = Depends(get_db)):
-    # Pydantic already validates bounds
     p = Place(**place.model_dump())
     db.add(p)
     try:
@@ -243,7 +252,6 @@ def create_place(place: PlaceCreate, db: Session = Depends(get_db)):
 
 @app.get("/places", response_model=List[PlaceOut])
 def list_places(db: Session = Depends(get_db)):
-    # رجّع الكل كما هو (لو عايز فقط السليم، حط WHERE في SQLAlchemy فلتر)
     return db.query(Place).order_by(Place.id.desc()).all()
 
 # ---- Places + Image (multipart) ----
@@ -276,22 +284,37 @@ async def create_place_with_image(
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    # تحقق يدوي من الإحداثيات في multipart
+    # تحقق من الإحداثيات
     validate_latlng(latitude, longitude)
 
-    ext = os.path.splitext(image.filename or "")[1].lower()
+    # تحقق من اسم ونوع الملف
+    filename = image.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
         raise HTTPException(status_code=400, detail="Unsupported image type")
 
+    # حفظ على دفعات + حد أقصى للحجم
     fname = f"{uuid.uuid4().hex}{ext}"
     fpath = os.path.join(UPLOAD_DIR, fname)
-    # اكتب الملف مباشرة بدون الاحتفاظ به في الذاكرة
-    with open(fpath, "wb") as f:
-        while True:
-            chunk = await image.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
+    total = 0
+    try:
+        with open(fpath, "wb") as f:
+            while True:
+                chunk = await image.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_IMAGE_BYTES:
+                    raise HTTPException(status_code=413, detail="Image too large (max 10MB)")
+                f.write(chunk)
+    except HTTPException:
+        # لو الحجم كبير احذف الملف
+        try:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        except Exception:
+            pass
+        raise
     image_url = f"/uploads/{fname}"
 
     p = Place(
@@ -308,9 +331,10 @@ async def create_place_with_image(
         db.commit()
     except Exception:
         db.rollback()
-        # لو فشل الإدخال، احذف الملف اللي اتحفظ
+        # لو فشل الإدخال، احذف الملف الذي تم حفظه
         try:
-            os.remove(fpath)
+            if os.path.exists(fpath):
+                os.remove(fpath)
         except Exception:
             pass
         raise
@@ -320,7 +344,6 @@ async def create_place_with_image(
 # ---- GeoJSON للتطبيق/الخريطة ----
 @app.get("/places/geojson", include_in_schema=False)
 def places_geojson(db: Session = Depends(get_db)):
-    # رجّع فقط السجلات ذات الإحداثيات الصحيحة
     rows = db.execute(text("""
         SELECT id, name, latitude, longitude, image_url
         FROM public.places
