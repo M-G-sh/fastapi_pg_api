@@ -477,10 +477,10 @@ def _piepe_resolve_cols(db: Session):
         LIMIT 1
     """), {"cands": PIEPE_ID_CANDIDATES}).scalar()
 
-    # detect geom column + type + srid (إن وُجد)
+    # detect geom column + type + srid (Cast column_name to text for Find_SRID)
     geom_row = db.execute(text("""
         SELECT c.column_name, c.udt_name,
-               COALESCE(Find_SRID('public','piepe', c.column_name), 0) AS srid
+               COALESCE(Find_SRID('public','piepe', c.column_name::text), 0) AS srid
         FROM information_schema.columns c
         WHERE c.table_schema='public' AND c.table_name='piepe'
           AND c.column_name = ANY(:cands)
@@ -496,16 +496,19 @@ def _piepe_resolve_cols(db: Session):
     udt_name = (geom_row["udt_name"] or "").lower()
     srid = int(geom_row["srid"] or 0)
     if srid <= 0:
-        srid = 4326  # افتراضيًا WGS84 لو مش معروف
+        srid = 4326  # default to WGS84
 
-    # نبني التعبير المناسب لإخراج GeoJSON حسب نوع العمود
+    # GeoJSON expression
     if udt_name == "geometry":
         geom_json_expr = f'ST_AsGeoJSON("{geom_col}")::json'
+        bbox_geom_expr = f'"{geom_col}"'  # نستخدمه في WHERE
     else:
-        # bytea (WKB) أو أي نوع آخر: حوّل من WKB إلى geometry مع SRID
+        # bytea (WKB)
         geom_json_expr = f'ST_AsGeoJSON(ST_SetSRID(ST_GeomFromWKB("{geom_col}"), {srid}))::json'
+        bbox_geom_expr = f'ST_SetSRID(ST_GeomFromWKB("{geom_col}"), {srid})'
 
-    return id_col, geom_col, geom_json_expr
+    return id_col, geom_col, geom_json_expr, bbox_geom_expr
+
 
 
 @app.get("/piepe/geojson")
@@ -515,16 +518,16 @@ def piepe_geojson(
     db: Session = Depends(get_db),
 ):
     """
-    يرجّع FeatureCollection GeoJSON من جدول public.piepe.
-    نتجنب حساسية الحروف ونراعي إذا كان عمود الهندسة bytea (WKB) أو geometry.
+    FeatureCollection من جدول public.piepe.
+    يتحمّل geometry أو bytea(WKB)، ويتجنب حساسية الحروف.
     """
-    id_col, geom_col, geom_json_expr = _piepe_resolve_cols(db)
+    id_col, geom_col, geom_json_expr, bbox_geom_expr = _piepe_resolve_cols(db)
 
     bbox_vals = _valid_bbox(bbox)
     where = "TRUE"
     params = {"limit": limit}
     if bbox_vals:
-        where = f'"{geom_col}" && ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326)'
+        where = f'{bbox_geom_expr} && ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326)'
         params.update({"minx": bbox_vals[0], "miny": bbox_vals[1], "maxx": bbox_vals[2], "maxy": bbox_vals[3]})
 
     sql = text(f"""
@@ -554,8 +557,11 @@ def piepe_geojson(
             "geometry": r["geometry"],
             "properties": dict(r["properties"]),
         })
-    coll = {"type": "FeatureCollection", "features": features}
-    return Response(content=json.dumps(coll, ensure_ascii=False), media_type="application/geo+json")
+    return Response(
+        content=json.dumps({"type": "FeatureCollection", "features": features}, ensure_ascii=False),
+        media_type="application/geo+json",
+    )
+
 
 
 @app.patch("/piepe/{fid}")
