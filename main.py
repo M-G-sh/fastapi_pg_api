@@ -468,7 +468,7 @@ PIEPE_ID_CANDIDATES = ["id", "fid", "ogc_fid", "gid", "objectid"]
 PIEPE_GEOM_CANDIDATES = ["geom", "wkb_geometry", "the_geom"]
 
 def _piepe_resolve_cols(db: Session):
-    # detect id column
+    # 1) id column
     id_col = db.execute(text("""
         SELECT column_name
         FROM information_schema.columns
@@ -477,10 +477,9 @@ def _piepe_resolve_cols(db: Session):
         LIMIT 1
     """), {"cands": PIEPE_ID_CANDIDATES}).scalar()
 
-    # detect geom column + type + srid (Cast column_name to text for Find_SRID)
+    # 2) geom column + udt_name
     geom_row = db.execute(text("""
-        SELECT c.column_name, c.udt_name,
-               COALESCE(Find_SRID('public','piepe', c.column_name::text), 0) AS srid
+        SELECT c.column_name, c.udt_name
         FROM information_schema.columns c
         WHERE c.table_schema='public' AND c.table_name='piepe'
           AND c.column_name = ANY(:cands)
@@ -494,21 +493,35 @@ def _piepe_resolve_cols(db: Session):
 
     geom_col = geom_row["column_name"]
     udt_name = (geom_row["udt_name"] or "").lower()
-    srid = int(geom_row["srid"] or 0)
-    if srid <= 0:
-        srid = 4326  # default to WGS84
 
-    # GeoJSON expression
+    # 3) استنتاج SRID من أول صف (بدون Find_SRID)
+    if udt_name == "geometry":
+        srid_row = db.execute(text(f"""
+            SELECT NULLIF(ST_SRID("{geom_col}"),0) AS srid
+            FROM public.piepe
+            WHERE "{geom_col}" IS NOT NULL
+            LIMIT 1
+        """)).mappings().first()
+    else:
+        # bytea/WKB
+        srid_row = db.execute(text(f"""
+            SELECT NULLIF(ST_SRID(ST_GeomFromWKB("{geom_col}")),0) AS srid
+            FROM public.piepe
+            WHERE "{geom_col}" IS NOT NULL
+            LIMIT 1
+        """)).mappings().first()
+
+    srid = int((srid_row or {}).get("srid") or 4326)
+
+    # 4) نبني تعبيرات الإخراج والـbbox حسب النوع
     if udt_name == "geometry":
         geom_json_expr = f'ST_AsGeoJSON("{geom_col}")::json'
-        bbox_geom_expr = f'"{geom_col}"'  # نستخدمه في WHERE
+        bbox_geom_expr = f'"{geom_col}"'
     else:
-        # bytea (WKB)
         geom_json_expr = f'ST_AsGeoJSON(ST_SetSRID(ST_GeomFromWKB("{geom_col}"), {srid}))::json'
         bbox_geom_expr = f'ST_SetSRID(ST_GeomFromWKB("{geom_col}"), {srid})'
 
     return id_col, geom_col, geom_json_expr, bbox_geom_expr
-
 
 
 @app.get("/piepe/geojson")
@@ -517,10 +530,6 @@ def piepe_geojson(
     limit: int = Query(5000, ge=1, le=100000),
     db: Session = Depends(get_db),
 ):
-    """
-    FeatureCollection من جدول public.piepe.
-    يتحمّل geometry أو bytea(WKB)، ويتجنب حساسية الحروف.
-    """
     id_col, geom_col, geom_json_expr, bbox_geom_expr = _piepe_resolve_cols(db)
 
     bbox_vals = _valid_bbox(bbox)
@@ -549,19 +558,17 @@ def piepe_geojson(
     """)
     rows = db.execute(sql, params).mappings().all()
 
-    features = []
-    for r in rows:
-        features.append({
-            "type": "Feature",
-            "id": int(r["fid"]),
-            "geometry": r["geometry"],
-            "properties": dict(r["properties"]),
-        })
+    features = [{
+        "type": "Feature",
+        "id": int(r["fid"]),
+        "geometry": r["geometry"],
+        "properties": dict(r["properties"]),
+    } for r in rows]
+
     return Response(
         content=json.dumps({"type": "FeatureCollection", "features": features}, ensure_ascii=False),
         media_type="application/geo+json",
     )
-
 
 
 @app.patch("/piepe/{fid}")
