@@ -464,6 +464,9 @@ def _valid_bbox(bbox: Optional[str]) -> Optional[List[float]]:
     except Exception:
         return None
 
+PIEPE_ID_CANDIDATES = ["id", "fid", "ogc_fid", "gid", "objectid"]
+PIEPE_GEOM_CANDIDATES = ["geom", "wkb_geometry", "the_geom"]
+
 def _piepe_resolve_cols(db: Session):
     # detect id column
     id_col = db.execute(text("""
@@ -474,21 +477,36 @@ def _piepe_resolve_cols(db: Session):
         LIMIT 1
     """), {"cands": PIEPE_ID_CANDIDATES}).scalar()
 
-    # detect geom column
-    geom_col = db.execute(text("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='piepe'
-          AND column_name = ANY(:cands)
+    # detect geom column + type + srid (إن وُجد)
+    geom_row = db.execute(text("""
+        SELECT c.column_name, c.udt_name,
+               COALESCE(Find_SRID('public','piepe', c.column_name), 0) AS srid
+        FROM information_schema.columns c
+        WHERE c.table_schema='public' AND c.table_name='piepe'
+          AND c.column_name = ANY(:cands)
         LIMIT 1
-    """), {"cands": PIEPE_GEOM_CANDIDATES}).scalar()
+    """), {"cands": PIEPE_GEOM_CANDIDATES}).mappings().first()
 
     if not id_col:
         raise HTTPException(status_code=500, detail="piepe id column not found (id/fid/ogc_fid/gid/objectid)")
-    if not geom_col:
+    if not geom_row:
         raise HTTPException(status_code=500, detail="piepe geometry column not found (geom/wkb_geometry/the_geom)")
 
-    return id_col, geom_col
+    geom_col = geom_row["column_name"]
+    udt_name = (geom_row["udt_name"] or "").lower()
+    srid = int(geom_row["srid"] or 0)
+    if srid <= 0:
+        srid = 4326  # افتراضيًا WGS84 لو مش معروف
+
+    # نبني التعبير المناسب لإخراج GeoJSON حسب نوع العمود
+    if udt_name == "geometry":
+        geom_json_expr = f'ST_AsGeoJSON("{geom_col}")::json'
+    else:
+        # bytea (WKB) أو أي نوع آخر: حوّل من WKB إلى geometry مع SRID
+        geom_json_expr = f'ST_AsGeoJSON(ST_SetSRID(ST_GeomFromWKB("{geom_col}"), {srid}))::json'
+
+    return id_col, geom_col, geom_json_expr
+
 
 @app.get("/piepe/geojson")
 def piepe_geojson(
@@ -498,18 +516,17 @@ def piepe_geojson(
 ):
     """
     يرجّع FeatureCollection GeoJSON من جدول public.piepe.
-    ما بنذكرش أسماء الأعمدة باليد عشان نتجنب حساسية الحروف.
+    نتجنب حساسية الحروف ونراعي إذا كان عمود الهندسة bytea (WKB) أو geometry.
     """
-    id_col, geom_col = _piepe_resolve_cols(db)
+    id_col, geom_col, geom_json_expr = _piepe_resolve_cols(db)
 
     bbox_vals = _valid_bbox(bbox)
     where = "TRUE"
     params = {"limit": limit}
     if bbox_vals:
-        where = f'{geom_col} && ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326)'
+        where = f'"{geom_col}" && ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326)'
         params.update({"minx": bbox_vals[0], "miny": bbox_vals[1], "maxx": bbox_vals[2], "maxy": bbox_vals[3]})
 
-    # نحول الصف كله لــjsonb ونشيل منه عمود الهندسة وعمود الـID
     sql = text(f"""
         WITH q AS (
           SELECT
@@ -523,7 +540,7 @@ def piepe_geojson(
         )
         SELECT
           fid,
-          ST_AsGeoJSON(geom)::json AS geometry,
+          {geom_json_expr} AS geometry,
           props AS properties
         FROM q;
     """)
