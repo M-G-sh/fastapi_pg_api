@@ -182,7 +182,7 @@ def on_startup():
         with engine.begin() as conn:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lat ON public.places (latitude)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lng ON public.places (longitude)"))
-            -- try/except not needed inside DO, so we leave as-is above
+           # -- try/except not needed inside DO, so we leave as-is above
             try:
                 conn.execute(text("ALTER TABLE public.places ADD CONSTRAINT chk_lat CHECK (latitude BETWEEN -90 AND 90)"))
             except Exception:
