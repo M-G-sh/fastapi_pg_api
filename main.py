@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 # =============================
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/demo_db")
-if DATABASE_URL.startswith("postgres://"):  # railway/old URIs
+if DATABASE_URL.startswith("postgres://"):  # railway old URIs
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # اختياري لتنظيف الداتا
@@ -134,7 +134,7 @@ class PlaceOut(PlaceCreate):
 # =============================
 # 5) App + CORS + static + logging
 # =============================
-app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.4.1")
+app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,17 +182,22 @@ def on_startup():
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lat ON public.places (latitude)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lng ON public.places (longitude)"))
             try:
-                conn.execute(text(
-                    "ALTER TABLE public.places ADD CONSTRAINT chk_lat CHECK (latitude BETWEEN -90 AND 90)"
-                ))
+                conn.execute(text("ALTER TABLE public.places ADD CONSTRAINT chk_lat CHECK (latitude BETWEEN -90 AND 90)"))
             except Exception:
                 pass
             try:
-                conn.execute(text(
-                    "ALTER TABLE public.places ADD CONSTRAINT chk_lng CHECK (longitude BETWEEN -180 AND 180)"
-                ))
+                conn.execute(text("ALTER TABLE public.places ADD CONSTRAINT chk_lng CHECK (longitude BETWEEN -180 AND 180)"))
             except Exception:
                 pass
+            # فهرس مكاني لجدول piepe (إن وجد)
+            conn.execute(text("""
+                DO $$
+                BEGIN
+                  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='piepe') THEN
+                    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_piepe_geom ON public.piepe USING GIST (geom)';
+                  END IF;
+                END$$;
+            """))
 
         print(f"✅ DB connected & tables/indexes ensured | UPLOAD_DIR={UPLOAD_DIR}")
     except Exception as e:
@@ -208,7 +213,7 @@ def validate_latlng(lat: float, lng: float):
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB
 
 # =============================
-# 8) Endpoints
+# 8) Endpoints (Root/Health/Users/Places)
 # =============================
 @app.get("/", include_in_schema=False)
 def root():
@@ -351,7 +356,7 @@ async def create_place_with_image(
     db.refresh(p)
     return p
 
-# ---- GeoJSON للتطبيق/الخريطة ----
+# ---- Places GeoJSON (نقاط) ----
 @app.get("/places/geojson", include_in_schema=False)
 def places_geojson(db: Session = Depends(get_db)):
     rows = db.execute(text("""
@@ -369,16 +374,13 @@ def places_geojson(db: Session = Depends(get_db)):
         features.append({
             "type": "Feature",
             "id": int(r["id"]),
-            "geometry": {
-                "type": "Point",
-                "coordinates": [float(r["longitude"]), float(r["latitude"])]
-            },
+            "geometry": {"type": "Point", "coordinates": [float(r["longitude"]), float(r["latitude"])]},
             "properties": {"name": r["name"], "image_url": r["image_url"]},
         })
     collection = {"type": "FeatureCollection", "features": features}
     return Response(content=json.dumps(collection, ensure_ascii=False), media_type="application/geo+json")
 
-# ---- أقرب أماكن (بدون PostGIS) ----
+# ---- أقرب أماكن (بدون PostGIS)
 @app.get("/places/near")
 def get_near_places(
     lat: float = Query(..., description="Latitude"),
@@ -389,11 +391,8 @@ def get_near_places(
 ):
     """
     يرجّع أقرب الأماكن مترتّبة بالمسافة (متر) باستخدام معادلة Haversine.
-    بنستخدم Bounding Box أولًا ثم نحسب المسافة بدقة لتسريع الاستعلام.
     """
     validate_latlng(lat, lng)
-
-    # درجة تقريبية للمتر (عند خط الاستواء ≈ 111.32 كم لكل درجة)
     deg = radius_m / 111_320.0
     sql = text("""
         SELECT id, name, latitude, longitude, image_url,
@@ -413,7 +412,7 @@ def get_near_places(
     rows = db.execute(sql, {"lat": lat, "lng": lng, "deg": deg, "limit": limit}).mappings().all()
     return [dict(r) for r in rows]
 
-# ---- تنظيف السجلات الخارجة عن المدى (اختياري/إداري) ----
+# ---- تنظيف سجلات خارج المدى (اختياري/إداري)
 @app.post("/admin/places/cleanup")
 def cleanup_invalid_coords(
     x_admin_token: Optional[str] = Header(None, alias="x-admin-token"),
@@ -431,3 +430,114 @@ def cleanup_invalid_coords(
     ids = [r[0] for r in res.fetchall()]
     db.commit()
     return {"cleaned": ids, "count": len(ids)}
+
+# =============================
+# 9) Piepe (PostGIS GeoJSON + PATCH)
+# =============================
+
+# الحقول المسموح تحديثها (بدون geom)
+PIEPE_EDITABLE_FIELDS = [
+    "FACILITYID","ELEVATION","INVERTLEVEL","GROUNDLEVEL","CONTRACTOR","SUBCONTRACTOR",
+    "PROJECTNO","PHASENO","ITEMNO","INSTALLATIONDATE","COVERMATERIAL","X","Y",
+    "ARNAME","ENNAME","WALLTHICKNESS","MNOHLESHAPE","DIMENSION","URLLINK"
+]
+
+def _valid_bbox(bbox: Optional[str]) -> Optional[List[float]]:
+    if not bbox:
+        return None
+    try:
+        parts = [float(x) for x in bbox.split(",")]
+        if len(parts) != 4:
+            return None
+        minx, miny, maxx, maxy = parts
+        if not (-180 <= minx <= 180 and -180 <= maxx <= 180 and -90 <= miny <= 90 and -90 <= maxy <= 90):
+            return None
+        if minx >= maxx or miny >= maxy:
+            return None
+        return [minx, miny, maxx, maxy]
+    except Exception:
+        return None
+
+@app.get("/piepe/geojson")
+def piepe_geojson(
+    bbox: Optional[str] = Query(None, description="minLng,minLat,maxLng,maxLat (EPSG:4326)"),
+    limit: int = Query(5000, ge=1, le=100000),
+    db: Session = Depends(get_db),
+):
+    """
+    يرجّع FeatureCollection GeoJSON من جدول public.piepe.
+    يدعم فلترة bbox اختياريًا لتحسين الأداء.
+    """
+    bbox_vals = _valid_bbox(bbox)
+    where = "TRUE"
+    params = {"limit": limit}
+    if bbox_vals:
+        where = "geom && ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326)"
+        params.update({"minx": bbox_vals[0], "miny": bbox_vals[1], "maxx": bbox_vals[2], "maxy": bbox_vals[3]})
+
+    props_cols = """
+        FACILITYID, ELEVATION, INVERTLEVEL, GROUNDLEVEL, CONTRACTOR, SUBCONTRACTOR,
+        PROJECTNO, PHASENO, ITEMNO, INSTALLATIONDATE, COVERMATERIAL, X, Y,
+        ARNAME, ENNAME, WALLTHICKNESS, MNOHLESHAPE, DIMENSION, URLLINK
+    """
+
+    sql = text(f"""
+        WITH q AS (
+          SELECT id, {props_cols}, geom
+          FROM public.piepe
+          WHERE {where}
+          ORDER BY id
+          LIMIT :limit
+        )
+        SELECT
+          id,
+          ST_AsGeoJSON(geom)::json AS geometry,
+          to_jsonb(q) - 'geom' AS properties
+        FROM q;
+    """)
+    rows = db.execute(sql, params).mappings().all()
+
+    features = []
+    for r in rows:
+        features.append({
+            "type": "Feature",
+            "id": int(r["id"]),
+            "geometry": r["geometry"],          # dict
+            "properties": dict(r["properties"]),# dict
+        })
+    coll = {"type": "FeatureCollection", "features": features}
+    return Response(content=json.dumps(coll, ensure_ascii=False), media_type="application/geo+json")
+
+@app.patch("/piepe/{fid}")
+def piepe_patch(
+    fid: int,
+    patch: dict,
+    db: Session = Depends(get_db),
+):
+    """
+    يعدّل خصائص السجل (بدون تعديل الهندسة).
+    Body (JSON): أي subset من PIEPE_EDITABLE_FIELDS
+    """
+    if not patch:
+        raise HTTPException(status_code=400, detail="Empty patch")
+
+    updates = {k: v for k, v in patch.items() if k in PIEPE_EDITABLE_FIELDS}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No editable fields in payload")
+
+    set_clauses = []
+    params = {"fid": fid}
+    i = 0
+    for k, v in updates.items():
+        i += 1
+        p = f"v{i}"
+        set_clauses.append(f'"{k}" = :{p}')
+        params[p] = v
+
+    sql = text(f'UPDATE public.piepe SET {", ".join(set_clauses)} WHERE id = :fid RETURNING id;')
+    res = db.execute(sql, params).first()
+    if not res:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Feature not found")
+    db.commit()
+    return {"ok": True, "id": fid, "updated": list(updates.keys())}
