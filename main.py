@@ -498,7 +498,7 @@ def piepe_geojson(
 ):
     """
     يرجّع FeatureCollection GeoJSON من جدول public.piepe.
-    يدعم فلترة bbox اختياريًا لتحسين الأداء.
+    ما بنذكرش أسماء الأعمدة باليد عشان نتجنب حساسية الحروف.
     """
     id_col, geom_col = _piepe_resolve_cols(db)
 
@@ -509,16 +509,14 @@ def piepe_geojson(
         where = f'{geom_col} && ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326)'
         params.update({"minx": bbox_vals[0], "miny": bbox_vals[1], "maxx": bbox_vals[2], "maxy": bbox_vals[3]})
 
-    props_cols = """
-        FACILITYID, ELEVATION, INVERTLEVEL, GROUNDLEVEL, CONTRACTOR, SUBCONTRACTOR,
-        PROJECTNO, PHASENO, ITEMNO, INSTALLATIONDATE, COVERMATERIAL, X, Y,
-        ARNAME, ENNAME, WALLTHICKNESS, MNOHLESHAPE, DIMENSION, URLLINK
-    """
-
+    # نحول الصف كله لــjsonb ونشيل منه عمود الهندسة وعمود الـID
     sql = text(f"""
         WITH q AS (
-          SELECT "{id_col}" AS fid, {props_cols}, "{geom_col}" AS geom
-          FROM public.piepe
+          SELECT
+            "{id_col}"  AS fid,
+            "{geom_col}" AS geom,
+            (to_jsonb(p) - '{geom_col}' - '{id_col}') AS props
+          FROM public.piepe AS p
           WHERE {where}
           ORDER BY "{id_col}"
           LIMIT :limit
@@ -526,7 +524,7 @@ def piepe_geojson(
         SELECT
           fid,
           ST_AsGeoJSON(geom)::json AS geometry,
-          (to_jsonb(q) - 'geom') - 'fid' AS properties
+          props AS properties
         FROM q;
     """)
     rows = db.execute(sql, params).mappings().all()
@@ -536,11 +534,12 @@ def piepe_geojson(
         features.append({
             "type": "Feature",
             "id": int(r["fid"]),
-            "geometry": r["geometry"],            # dict
-            "properties": dict(r["properties"]),  # dict
+            "geometry": r["geometry"],
+            "properties": dict(r["properties"]),
         })
     coll = {"type": "FeatureCollection", "features": features}
     return Response(content=json.dumps(coll, ensure_ascii=False), media_type="application/geo+json")
+
 
 @app.patch("/piepe/{fid}")
 def piepe_patch(
