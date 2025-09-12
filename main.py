@@ -134,7 +134,7 @@ class PlaceOut(PlaceCreate):
 # =============================
 # 5) App + CORS + static + logging
 # =============================
-app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.6.1")
+app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.6.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -359,7 +359,7 @@ async def create_place_with_image(
     db.refresh(p)
     return p
 
-# ---- Places GeoJSON (نقاط)
+# ---- Places GeoJSON (Points)
 @app.get("/places/geojson", include_in_schema=False)
 def places_geojson(db: Session = Depends(get_db)):
     rows = db.execute(text("""
@@ -383,7 +383,7 @@ def places_geojson(db: Session = Depends(get_db)):
     collection = {"type": "FeatureCollection", "features": features}
     return Response(content=json.dumps(collection, ensure_ascii=False), media_type="application/geo+json")
 
-# ---- أقرب أماكن (بدون PostGIS)
+# ---- Places Near (no PostGIS)
 @app.get("/places/near")
 def get_near_places(
     lat: float = Query(..., description="Latitude"),
@@ -412,7 +412,7 @@ def get_near_places(
     rows = db.execute(sql, {"lat": lat, "lng": lng, "deg": deg, "limit": limit}).mappings().all()
     return [dict(r) for r in rows]
 
-# ---- تنظيف سجلات خارج المدى (اختياري/إداري)
+# ---- Admin cleanup
 @app.post("/admin/places/cleanup")
 def cleanup_invalid_coords(
     x_admin_token: Optional[str] = Header(None, alias="x-admin-token"),
@@ -435,14 +435,13 @@ def cleanup_invalid_coords(
 # 9) Piepe (PostGIS GeoJSON + PATCH)
 # =============================
 
-# الحقول المسموح تحديثها (بدون geom)
 PIEPE_EDITABLE_FIELDS = [
     "FACILITYID","ELEVATION","INVERTLEVEL","GROUNDLEVEL","CONTRACTOR","SUBCONTRACTOR",
     "PROJECTNO","PHASENO","ITEMNO","INSTALLATIONDATE","COVERMATERIAL","X","Y",
     "ARNAME","ENNAME","WALLTHICKNESS","MNOHLESHAPE","DIMENSION","URLLINK"
 ]
 
-PIEPE_ID_CANDIDATES = ["id", "fid", "ogc_fid", "gid", "objectid"]
+PIEPE_ID_CANDIDATES   = ["id", "fid", "ogc_fid", "gid", "objectid"]
 PIEPE_GEOM_CANDIDATES = ["geom", "wkb_geometry", "the_geom"]
 
 def _valid_bbox(bbox: Optional[str]) -> Optional[List[float]]:
@@ -488,21 +487,25 @@ def _piepe_resolve_cols(db: Session) -> Tuple[str, str, str, str]:
     geom_col = geom_row["column_name"]
     udt_name = (geom_row["udt_name"] or "").lower()
 
-    # 3) استنتاج SRID من أول صف
-    srid_row = db.execute(text(f"""
-        SELECT NULLIF(
-          CASE
-            WHEN '{udt_name}'='geometry' THEN ST_SRID("{geom_col}")
-            ELSE ST_SRID(ST_GeomFromWKB("{geom_col}"))
-          END
-        ,0) AS srid
-        FROM public.piepe
-        WHERE "{geom_col}" IS NOT NULL
-        LIMIT 1
-    """)).mappings().first()
+    # 3) استنتاج SRID من أول صف (باستعلام منفصل لكل نوع)
+    if udt_name == "geometry":
+        srid_row = db.execute(text(f"""
+            SELECT NULLIF(ST_SRID("{geom_col}"),0) AS srid
+            FROM public.piepe
+            WHERE "{geom_col}" IS NOT NULL
+            LIMIT 1
+        """)).mappings().first()
+    else:
+        srid_row = db.execute(text(f"""
+            SELECT NULLIF(ST_SRID(ST_GeomFromWKB("{geom_col}"::bytea)),0) AS srid
+            FROM public.piepe
+            WHERE "{geom_col}" IS NOT NULL
+            LIMIT 1
+        """)).mappings().first()
+
     srid = int((srid_row or {}).get("srid") or 4326)
 
-    # 4) تعبيرات الإخراج والفلترة (نحوّل دوماً لـ 4326)
+    # 4) تعبيرات الإخراج والفلترة (نحوّل دايمًا لـ 4326)
     if udt_name == "geometry":
         geom_in_4326 = f"""
             CASE WHEN ST_SRID("{geom_col}")=4326
@@ -511,9 +514,17 @@ def _piepe_resolve_cols(db: Session) -> Tuple[str, str, str, str]:
             END
         """
     else:
-        geom_in_4326 = f"ST_Transform(ST_GeomFromWKB(\"{geom_col}\"), 4326)"
+        geom_in_4326 = f"""
+            ST_Transform(
+                ST_SetSRID(
+                    ST_GeomFromWKB("{geom_col}"::bytea),
+                    {srid}
+                ),
+                4326
+            )
+        """
 
-    geom_json_expr = f"ST_AsGeoJSON({geom_in_4326})::json"
+    geom_json_expr   = f"ST_AsGeoJSON({geom_in_4326})::json"
     bbox_filter_expr = f"ST_Intersects({geom_in_4326}, ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326))"
 
     return id_col, geom_col, geom_json_expr, bbox_filter_expr
@@ -570,10 +581,6 @@ def piepe_patch(
     patch: dict,
     db: Session = Depends(get_db),
 ):
-    """
-    يعدّل خصائص السجل (بدون تعديل الهندسة).
-    Body (JSON): أي subset من PIEPE_EDITABLE_FIELDS
-    """
     if not patch:
         raise HTTPException(status_code=400, detail="Empty patch")
 
