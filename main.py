@@ -4,12 +4,11 @@ import uuid
 import json
 import logging
 import traceback
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fastapi import (
     FastAPI, Depends, HTTPException, UploadFile, File, Form, Response, Query, Request, Header
 )
-    # noqa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
@@ -135,7 +134,7 @@ class PlaceOut(PlaceCreate):
 # =============================
 # 5) App + CORS + static + logging
 # =============================
-app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.6.0")
+app = FastAPI(title="FastAPI + PostgreSQL Demo", version="0.6.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,7 +181,6 @@ def on_startup():
         with engine.begin() as conn:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lat ON public.places (latitude)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_places_lng ON public.places (longitude)"))
-           # -- try/except not needed inside DO, so we leave as-is above
             try:
                 conn.execute(text("ALTER TABLE public.places ADD CONSTRAINT chk_lat CHECK (latitude BETWEEN -90 AND 90)"))
             except Exception:
@@ -191,7 +189,8 @@ def on_startup():
                 conn.execute(text("ALTER TABLE public.places ADD CONSTRAINT chk_lng CHECK (longitude BETWEEN -180 AND 180)"))
             except Exception:
                 pass
-            # فهرس مكاني ديناميكي لجدول piepe (يعتمد على geometry_columns)
+
+            # فهرس مكاني ديناميكي لجدول piepe (لو لقى عمود هندسي)
             conn.execute(text("""
                 DO $$
                 DECLARE gcol text;
@@ -201,6 +200,7 @@ def on_startup():
                   FROM public.geometry_columns
                   WHERE f_table_schema='public' AND f_table_name='piepe'
                   LIMIT 1;
+
                   IF gcol IS NOT NULL THEN
                     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_piepe_geom ON public.piepe USING GIST (%I)', gcol);
                   END IF;
@@ -307,16 +307,13 @@ async def create_place_with_image(
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    # تحقق من الإحداثيات
     validate_latlng(latitude, longitude)
 
-    # تحقق من اسم ونوع الملف
     filename = image.filename or ""
     ext = os.path.splitext(filename)[1].lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
         raise HTTPException(status_code=400, detail="Unsupported image type")
 
-    # حفظ على دفعات + حد أقصى للحجم
     fname = f"{uuid.uuid4().hex}{ext}"
     fpath = os.path.join(UPLOAD_DIR, fname)
     total = 0
@@ -464,10 +461,7 @@ def _valid_bbox(bbox: Optional[str]) -> Optional[List[float]]:
     except Exception:
         return None
 
-PIEPE_ID_CANDIDATES = ["id", "fid", "ogc_fid", "gid", "objectid"]
-PIEPE_GEOM_CANDIDATES = ["geom", "wkb_geometry", "the_geom"]
-
-def _piepe_resolve_cols(db: Session):
+def _piepe_resolve_cols(db: Session) -> Tuple[str, str, str, str]:
     # 1) id column
     id_col = db.execute(text("""
         SELECT column_name
@@ -494,35 +488,35 @@ def _piepe_resolve_cols(db: Session):
     geom_col = geom_row["column_name"]
     udt_name = (geom_row["udt_name"] or "").lower()
 
-    # 3) استنتاج SRID من أول صف (بدون Find_SRID)
-    if udt_name == "geometry":
-        srid_row = db.execute(text(f"""
-            SELECT NULLIF(ST_SRID("{geom_col}"),0) AS srid
-            FROM public.piepe
-            WHERE "{geom_col}" IS NOT NULL
-            LIMIT 1
-        """)).mappings().first()
-    else:
-        # bytea/WKB
-        srid_row = db.execute(text(f"""
-            SELECT NULLIF(ST_SRID(ST_GeomFromWKB("{geom_col}")),0) AS srid
-            FROM public.piepe
-            WHERE "{geom_col}" IS NOT NULL
-            LIMIT 1
-        """)).mappings().first()
-
+    # 3) استنتاج SRID من أول صف
+    srid_row = db.execute(text(f"""
+        SELECT NULLIF(
+          CASE
+            WHEN '{udt_name}'='geometry' THEN ST_SRID("{geom_col}")
+            ELSE ST_SRID(ST_GeomFromWKB("{geom_col}"))
+          END
+        ,0) AS srid
+        FROM public.piepe
+        WHERE "{geom_col}" IS NOT NULL
+        LIMIT 1
+    """)).mappings().first()
     srid = int((srid_row or {}).get("srid") or 4326)
 
-    # 4) نبني تعبيرات الإخراج والـbbox حسب النوع
+    # 4) تعبيرات الإخراج والفلترة (نحوّل دوماً لـ 4326)
     if udt_name == "geometry":
-        geom_json_expr = f'ST_AsGeoJSON("{geom_col}")::json'
-        bbox_geom_expr = f'"{geom_col}"'
+        geom_in_4326 = f"""
+            CASE WHEN ST_SRID("{geom_col}")=4326
+                 THEN "{geom_col}"
+                 ELSE ST_Transform("{geom_col}", 4326)
+            END
+        """
     else:
-        geom_json_expr = f'ST_AsGeoJSON(ST_SetSRID(ST_GeomFromWKB("{geom_col}"), {srid}))::json'
-        bbox_geom_expr = f'ST_SetSRID(ST_GeomFromWKB("{geom_col}"), {srid})'
+        geom_in_4326 = f"ST_Transform(ST_GeomFromWKB(\"{geom_col}\"), 4326)"
 
-    return id_col, geom_col, geom_json_expr, bbox_geom_expr
+    geom_json_expr = f"ST_AsGeoJSON({geom_in_4326})::json"
+    bbox_filter_expr = f"ST_Intersects({geom_in_4326}, ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326))"
 
+    return id_col, geom_col, geom_json_expr, bbox_filter_expr
 
 @app.get("/piepe/geojson")
 def piepe_geojson(
@@ -530,13 +524,13 @@ def piepe_geojson(
     limit: int = Query(5000, ge=1, le=100000),
     db: Session = Depends(get_db),
 ):
-    id_col, geom_col, geom_json_expr, bbox_geom_expr = _piepe_resolve_cols(db)
+    id_col, geom_col, geom_json_expr, bbox_filter_expr = _piepe_resolve_cols(db)
 
-    bbox_vals = _valid_bbox(bbox)
     where = "TRUE"
     params = {"limit": limit}
+    bbox_vals = _valid_bbox(bbox)
     if bbox_vals:
-        where = f'{bbox_geom_expr} && ST_MakeEnvelope(:minx,:miny,:maxx,:maxy,4326)'
+        where = bbox_filter_expr
         params.update({"minx": bbox_vals[0], "miny": bbox_vals[1], "maxx": bbox_vals[2], "maxy": bbox_vals[3]})
 
     sql = text(f"""
@@ -570,7 +564,6 @@ def piepe_geojson(
         media_type="application/geo+json",
     )
 
-
 @app.patch("/piepe/{fid}")
 def piepe_patch(
     fid: int,
@@ -588,7 +581,7 @@ def piepe_patch(
     if not updates:
         raise HTTPException(status_code=400, detail="No editable fields in payload")
 
-    id_col, _ = _piepe_resolve_cols(db)
+    id_col, _, _, _ = _piepe_resolve_cols(db)
 
     set_clauses = []
     params = {"fid": fid}
